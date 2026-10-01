@@ -24,8 +24,6 @@ app.add_middleware(
 
 TRIPO_API_KEY = os.getenv("TRIPO_API_KEY")
 
-# التحديث الأهم: استخدام إصدار V3 API الرسمية
-TRIPO_BASE_URL = "https://api.tripo3d.ai/v3/openapi"
 
 MODEL_PATH = "face_landmarker.task"
 
@@ -83,8 +81,10 @@ def extract_face_landmarks(image_bytes: bytes) -> FaceAnalysis:
         raise HTTPException(status_code=500, detail=f"MediaPipe processing error: {str(e)}")
 
 
+ # 1. تحديث الـ Base URL الرسمي لـ Tripo API V3
+TRIPO_BASE_URL = "https://openapi.tripo3d.ai/v3"
+
 async def generate_3d_from_tripo(image_bytes: bytes, filename: str) -> dict:
-    """رفع الصورة وتوليد مجسم 3D عبر Tripo3D V3 API"""
     if not TRIPO_API_KEY:
         logger.error("TRIPO_API_KEY is missing in environment variables!")
         raise HTTPException(status_code=500, detail="TRIPO_API_KEY environment variable is not set")
@@ -96,23 +96,27 @@ async def generate_3d_from_tripo(image_bytes: bytes, filename: str) -> dict:
 
     try:
         async with httpx.AsyncClient(timeout=60.0) as client:
-            # 1. رفع الصورة للحصول على file_token
+            # 2. مسار رفع الملفات الصحيح في V3 هو /files
             files = {"file": (filename, image_bytes, "image/jpeg")}
             upload_headers = {"Authorization": f"Bearer {TRIPO_API_KEY}"}
-            upload_res = await client.post(f"{TRIPO_BASE_URL}/upload", headers=upload_headers, files=files)
+            
+            upload_res = await client.post(f"{TRIPO_BASE_URL}/files", headers=upload_headers, files=files)
             
             if upload_res.status_code != 200:
                 logger.error(f"Tripo Upload Failed: {upload_res.text}")
                 raise HTTPException(status_code=500, detail=f"Tripo upload failed: {upload_res.text}")
-            image_token = upload_res.json().get("data", {}).get("image_token")
 
-            # 2. إنشاء مهمة توليد الـ 3D بتنسيق V3 API
+            upload_data = upload_res.json().get("data", {})
+            # استخراج file_token أو image_token
+            file_token = upload_data.get("image_token") or upload_data.get("file_token")
+
+            # 3. إرسال طلب التوليد
             task_payload = {
                 "type": "image_to_model",
                 "model_version": "v3.0",
                 "file": {
                     "type": "jpg",
-                    "file_token": image_token
+                    "file_token": file_token
                 }
             }
 
@@ -124,7 +128,7 @@ async def generate_3d_from_tripo(image_bytes: bytes, filename: str) -> dict:
 
             task_id = task_res.json().get("data", {}).get("task_id")
 
-            # 3. متابعة حالة التوليد (Polling Loop)
+            # 4. Polling لمتابعة حالة التوليد
             model_url = None
             for _ in range(30):
                 await asyncio.sleep(2)
@@ -145,7 +149,6 @@ async def generate_3d_from_tripo(image_bytes: bytes, filename: str) -> dict:
     except Exception as e:
         logger.error(f"Error in generate_3d_from_tripo: {str(e)}")
         raise HTTPException(status_code=500, detail=f"Tripo3D API Error: {str(e)}")
-
 
 @app.get("/")
 def health_check():
