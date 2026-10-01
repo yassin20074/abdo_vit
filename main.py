@@ -81,7 +81,6 @@ def extract_face_landmarks(image_bytes: bytes) -> FaceAnalysis:
         raise HTTPException(status_code=500, detail=f"MediaPipe processing error: {str(e)}")
 
 
- # 1. تحديث الـ Base URL الرسمي لـ Tripo API V3
 TRIPO_BASE_URL = "https://openapi.tripo3d.ai/v3"
 
 async def generate_3d_from_tripo(image_bytes: bytes, filename: str) -> dict:
@@ -96,7 +95,7 @@ async def generate_3d_from_tripo(image_bytes: bytes, filename: str) -> dict:
 
     try:
         async with httpx.AsyncClient(timeout=60.0) as client:
-            # 2. مسار رفع الملفات الصحيح في V3 هو /files
+            # 1. رفع الصورة عبر /files
             files = {"file": (filename, image_bytes, "image/jpeg")}
             upload_headers = {"Authorization": f"Bearer {TRIPO_API_KEY}"}
             
@@ -107,20 +106,21 @@ async def generate_3d_from_tripo(image_bytes: bytes, filename: str) -> dict:
                 raise HTTPException(status_code=500, detail=f"Tripo upload failed: {upload_res.text}")
 
             upload_data = upload_res.json().get("data", {})
-            # استخراج file_token أو image_token
-            file_token = upload_data.get("image_token") or upload_data.get("file_token")
+            file_token = upload_data.get("file_token") or upload_data.get("image_token")
 
-            # 3. إرسال طلب التوليد
+            # 2. إنشاء مهمة التوليد عبر Endpoint المخصص لـ Image to Model في V3
             task_payload = {
-                "type": "image_to_model",
-                "model_version": "v3.0",
                 "file": {
                     "type": "jpg",
                     "file_token": file_token
                 }
             }
 
-            task_res = await client.post(f"{TRIPO_BASE_URL}/task", headers=headers, json=task_payload)
+            task_res = await client.post(
+                f"{TRIPO_BASE_URL}/generation/image-to-model",
+                headers=headers,
+                json=task_payload
+            )
             
             if task_res.status_code != 200:
                 logger.error(f"Tripo Task Creation Failed: {task_res.text}")
@@ -128,20 +128,21 @@ async def generate_3d_from_tripo(image_bytes: bytes, filename: str) -> dict:
 
             task_id = task_res.json().get("data", {}).get("task_id")
 
-            # 4. Polling لمتابعة حالة التوليد
+            # 3. الاستعلام عن النتيجة بـ Polling على /v3/tasks/{task_id}
             model_url = None
-            for _ in range(30):
+            for _ in range(40):
                 await asyncio.sleep(2)
-                status_res = await client.get(f"{TRIPO_BASE_URL}/task/{task_id}", headers=headers)
+                status_res = await client.get(f"{TRIPO_BASE_URL}/tasks/{task_id}", headers=headers)
                 if status_res.status_code == 200:
                     res_data = status_res.json().get("data", {})
                     current_status = res_data.get("status")
 
                     if current_status == "success":
                         output = res_data.get("output", {})
-                        model_url = output.get("model") or output.get("pbr_model")
+                        # في V3 الاستجابة تُرجع model_url أو pbr_model_url مباشرة
+                        model_url = output.get("model_url") or output.get("pbr_model_url") or output.get("model")
                         break
-                    elif current_status in ["failed", "cancelled"]:
+                    elif current_status in ["failed", "cancelled", "banned"]:
                         logger.error(f"Tripo Task Failed: {res_data}")
                         raise HTTPException(status_code=500, detail="Tripo 3D generation task failed")
 
