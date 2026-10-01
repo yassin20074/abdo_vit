@@ -41,6 +41,18 @@ if not os.path.exists(MODEL_PATH):
         logger.error(f"Failed to download MediaPipe model: {str(e)}")
 
 
+# قائمة الـ IDs الخاصة بالنظارات / تجربة الافتراضية
+KEY_LANDMARK_IDS = {
+    6: "nose_bridge",
+    168: "nose_top",
+    33: "left_eye_outer",
+    133: "left_eye_inner",
+    263: "right_eye_outer",
+    362: "right_eye_inner",
+    127: "left_temple",
+    356: "right_temple"
+}
+
 def extract_face_landmarks(image_bytes: bytes) -> FaceAnalysis:
     try:
         nparr = np.frombuffer(image_bytes, np.uint8)
@@ -62,7 +74,7 @@ def extract_face_landmarks(image_bytes: bytes) -> FaceAnalysis:
             base_options=BaseOptions(model_asset_path=MODEL_PATH),
             running_mode=VisionRunningMode.IMAGE,
             num_faces=1,
-            min_face_detection_confidence=0.3 # تقليل العتبة لزيادة حساسية الاكتشاف
+            min_face_detection_confidence=0.3
         )
 
         with FaceLandmarker.create_from_options(options) as landmarker:
@@ -73,9 +85,12 @@ def extract_face_landmarks(image_bytes: bytes) -> FaceAnalysis:
                 return FaceAnalysis(detected=False, landmarks=[])
 
             face_landmarks = detection_result.face_landmarks[0]
+            
+            # تصفية النقاط لإرجاع النقاط المهمة فقط للنظارات
             landmarks_list = [
                 Landmark3D(id=idx, x=lm.x, y=lm.y, z=lm.z)
                 for idx, lm in enumerate(face_landmarks)
+                if idx in KEY_LANDMARK_IDS
             ]
 
             return FaceAnalysis(detected=True, landmarks=landmarks_list)
