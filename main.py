@@ -91,7 +91,7 @@ async def generate_3d_from_tripo(image_bytes: bytes, filename: str) -> dict:
 
     try:
         async with httpx.AsyncClient(timeout=60.0) as client:
-            # 1. رفع الصورة للحصول على image_token
+            # 1. رفع الصورة للحصول على file_token
             files = {"file": (filename, image_bytes, "image/jpeg")}
             upload_headers = {"Authorization": f"Bearer {TRIPO_API_KEY}"}
             upload_res = await client.post(f"{TRIPO_BASE_URL}/upload", headers=upload_headers, files=files)
@@ -102,9 +102,10 @@ async def generate_3d_from_tripo(image_bytes: bytes, filename: str) -> dict:
 
             image_token = upload_res.json().get("data", {}).get("image_token")
 
-            # 2. الهيكل الصحيح لـ Tripo3D v2 API
+            # 2. الهيكل الخاص بـ Tripo API V3
             task_payload = {
                 "type": "image_to_model",
+                "model_version": "v3.0",  # يمكنك استخدام v3.0 أو v3.1
                 "file": {
                     "type": "jpg",
                     "file_token": image_token
