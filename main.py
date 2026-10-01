@@ -1,3 +1,4 @@
+import logging
 import os
 import asyncio
 import httpx
@@ -8,13 +9,11 @@ from fastapi import FastAPI, File, UploadFile, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
 from schemas import User3DResponse, FaceAnalysis, Landmark3D
 
-app = FastAPI(
-    title="User 3D Model & Face Landmarks API",
-    description="API to generate 3D model from user photo and extract 3D face mesh coordinates using MediaPipe Tasks",
-    version="1.0.0"
-)
+logging.basicConfig(level=logging.INFO)
+logger = logging.getLogger(__name__)
 
-# السماح لجميع المصادر بالوصول (CORS)
+app = FastAPI(title="User 3D Model & Face Landmarks API", version="1.0.0")
+
 app.add_middleware(
     CORSMiddleware,
     allow_origins=["*"],
@@ -23,111 +22,114 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
-# قراءة مفتاح الـ API من متغيرات البيئة في Railway
 TRIPO_API_KEY = os.getenv("TRIPO_API_KEY")
 TRIPO_BASE_URL = "https://api.tripo3d.ai/v2/openapi"
 
-# تهيئة MediaPipe FaceLandmarker (Tasks API)
-BaseOptions = mp.tasks.BaseOptions
-FaceLandmarker = mp.tasks.vision.FaceLandmarker
-FaceLandmarkerOptions = mp.tasks.vision.FaceLandmarkerOptions
-VisionRunningMode = mp.tasks.vision.RunningMode
-
-# تحميل نموذج FaceLandmarker
-# يمكنك وضع ملف face_landmarker.task في مجلد المشروع أو تحميله تلقائياً
 MODEL_PATH = "face_landmarker.task"
 
-# تنزيل ملف النموذج التلقائي إن لم يكن موجوداً
+# تنزيل النموذج مع معالجة الأخطاء
 if not os.path.exists(MODEL_PATH):
     import urllib.request
-    model_url = "https://storage.googleapis.com/mediapipe-models/face_landmarker/face_landmarker/float16/1/face_landmarker.task"
-    urllib.request.urlretrieve(model_url, MODEL_PATH)
-
-options = FaceLandmarkerOptions(
-    base_options=BaseOptions(model_asset_path=MODEL_PATH),
-    running_mode=VisionRunningMode.IMAGE,
-    num_faces=1,
-    min_face_detection_confidence=0.5
-)
+    try:
+        model_url = "https://storage.googleapis.com/mediapipe-models/face_landmarker/face_landmarker/float16/1/face_landmarker.task"
+        logger.info("Downloading face_landmarker.task...")
+        urllib.request.urlretrieve(model_url, MODEL_PATH)
+        logger.info("Download completed.")
+    except Exception as e:
+        logger.error(f"Failed to download MediaPipe model: {str(e)}")
 
 
 def extract_face_landmarks(image_bytes: bytes) -> FaceAnalysis:
-    """تحليل صورة الشخص واستخراج جميع إحداثيات الوجه بـ MediaPipe Face Landmarker API"""
-    nparr = np.frombuffer(image_bytes, np.uint8)
-    img = cv2.imdecode(nparr, cv2.IMREAD_COLOR)
+    try:
+        nparr = np.frombuffer(image_bytes, np.uint8)
+        img = cv2.imdecode(nparr, cv2.IMREAD_COLOR)
 
-    if img is None:
-        raise HTTPException(status_code=400, detail="الصورة المرسلة غير صالحة")
+        if img is None:
+            raise HTTPException(status_code=400, detail="الصورة المرسلة غير صالحة")
 
-    img_rgb = cv2.cvtColor(img, cv2.COLOR_BGR2RGB)
-    mp_image = mp.Image(image_format=mp.ImageFormat.SRGB, data=img_rgb)
+        img_rgb = cv2.cvtColor(img, cv2.COLOR_BGR2RGB)
+        mp_image = mp.Image(image_format=mp.ImageFormat.SRGB, data=img_rgb)
 
-    with FaceLandmarker.create_from_options(options) as landmarker:
-        detection_result = landmarker.detect(mp_image)
+        BaseOptions = mp.tasks.BaseOptions
+        FaceLandmarker = mp.tasks.vision.FaceLandmarker
+        FaceLandmarkerOptions = mp.tasks.vision.FaceLandmarkerOptions
+        VisionRunningMode = mp.tasks.vision.RunningMode
 
-        if not detection_result.face_landmarks:
-            return FaceAnalysis(detected=False, landmarks=[])
+        options = FaceLandmarkerOptions(
+            base_options=BaseOptions(model_asset_path=MODEL_PATH),
+            running_mode=VisionRunningMode.IMAGE,
+            num_faces=1,
+            min_face_detection_confidence=0.5
+        )
 
-        face_landmarks = detection_result.face_landmarks[0]
-        landmarks_list = [
-            Landmark3D(id=idx, x=lm.x, y=lm.y, z=lm.z)
-            for idx, lm in enumerate(face_landmarks)
-        ]
+        with FaceLandmarker.create_from_options(options) as landmarker:
+            detection_result = landmarker.detect(mp_image)
 
-        return FaceAnalysis(detected=True, landmarks=landmarks_list)
+            if not detection_result.face_landmarks:
+                return FaceAnalysis(detected=False, landmarks=[])
+
+            face_landmarks = detection_result.face_landmarks[0]
+            landmarks_list = [
+                Landmark3D(id=idx, x=lm.x, y=lm.y, z=lm.z)
+                for idx, lm in enumerate(face_landmarks)
+            ]
+
+            return FaceAnalysis(detected=True, landmarks=landmarks_list)
+    except Exception as e:
+        logger.error(f"Error in extract_face_landmarks: {str(e)}")
+        raise HTTPException(status_code=500, detail=f"MediaPipe processing error: {str(e)}")
 
 
 async def generate_3d_from_tripo(image_bytes: bytes, filename: str) -> dict:
-    """رفع صورة الشخص لـ Tripo3D وإرجاع رابط ملف الـ 3D"""
     if not TRIPO_API_KEY:
-        raise HTTPException(
-            status_code=500,
-            detail="لم يتم ضبط TRIPO_API_KEY في متغيرات البيئة"
-        )
+        logger.error("TRIPO_API_KEY is missing in environment variables!")
+        raise HTTPException(status_code=500, detail="TRIPO_API_KEY environment variable is not set")
 
     headers = {"Authorization": f"Bearer {TRIPO_API_KEY}"}
 
-    async with httpx.AsyncClient(timeout=60.0) as client:
-        # 1. رفع صورة الشخص للحصول على image_token
-        files = {"file": (filename, image_bytes, "image/jpeg")}
-        upload_res = await client.post(f"{TRIPO_BASE_URL}/upload", headers=headers, files=files)
-        
-        if upload_res.status_code != 200:
-            raise HTTPException(status_code=500, detail=f"فشل رفع الصورة: {upload_res.text}")
+    try:
+        async with httpx.AsyncClient(timeout=60.0) as client:
+            files = {"file": (filename, image_bytes, "image/jpeg")}
+            upload_res = await client.post(f"{TRIPO_BASE_URL}/upload", headers=headers, files=files)
+            
+            if upload_res.status_code != 200:
+                logger.error(f"Tripo Upload Failed: {upload_res.text}")
+                raise HTTPException(status_code=500, detail=f"Tripo upload failed: {upload_res.text}")
 
-        image_token = upload_res.json().get("data", {}).get("image_token")
+            image_token = upload_res.json().get("data", {}).get("image_token")
 
-        # 2. بدء مهمة تحويل الصورة إلى مجسم 3D
-        task_payload = {
-            "type": "image_to_3d",
-            "file": {
-                "type": "jpg",
-                "file_token": image_token
+            task_payload = {
+                "type": "image_to_3d",
+                "file": {"type": "jpg", "file_token": image_token}
             }
-        }
-        task_res = await client.post(f"{TRIPO_BASE_URL}/task", headers=headers, json=task_payload)
-        
-        if task_res.status_code != 200:
-            raise HTTPException(status_code=500, detail=f"فشل بدء عملية الـ 3D: {task_res.text}")
+            task_res = await client.post(f"{TRIPO_BASE_URL}/task", headers=headers, json=task_payload)
+            
+            if task_res.status_code != 200:
+                logger.error(f"Tripo Task Creation Failed: {task_res.text}")
+                raise HTTPException(status_code=500, detail=f"Tripo task creation failed: {task_res.text}")
 
-        task_id = task_res.json().get("data", {}).get("task_id")
-        # 3. متابعة حالة المهمة حتى تجهيز ملف الـ 3D (GLB)
-        model_url = None
-        for _ in range(30):
-            await asyncio.sleep(2)
-            status_res = await client.get(f"{TRIPO_BASE_URL}/task/{task_id}", headers=headers)
-            if status_res.status_code == 200:
-                res_data = status_res.json().get("data", {})
-                current_status = res_data.get("status")
+            task_id = task_res.json().get("data", {}).get("task_id")
 
-                if current_status == "success":
-                    output = res_data.get("output", {})
-                    model_url = output.get("model") or output.get("pbr_model")
-                    break
-                elif current_status in ["failed", "cancelled"]:
-                    raise HTTPException(status_code=500, detail="فشلت عملية توليد ملف الـ 3D من الصورة")
+            model_url = None
+            for _ in range(30):
+                await asyncio.sleep(2)
+                status_res = await client.get(f"{TRIPO_BASE_URL}/task/{task_id}", headers=headers)
+                if status_res.status_code == 200:
+                    res_data = status_res.json().get("data", {})
+                    current_status = res_data.get("status")
 
-        return {"task_id": task_id, "model_url": model_url}
+                    if current_status == "success":
+                        output = res_data.get("output", {})
+                        model_url = output.get("model") or output.get("pbr_model")
+                        break
+                    elif current_status in ["failed", "cancelled"]:
+                        logger.error(f"Tripo Task Failed: {res_data}")
+                        raise HTTPException(status_code=500, detail="Tripo 3D generation task failed")
+
+            return {"task_id": task_id, "model_url": model_url}
+    except Exception as e:
+        logger.error(f"Error in generate_3d_from_tripo: {str(e)}")
+        raise HTTPException(status_code=500, detail=f"Tripo3D API Error: {str(e)}")
 
 
 @app.get("/")
@@ -137,13 +139,8 @@ def health_check():
 
 @app.post("/api/v1/process-user-image", response_model=User3DResponse)
 async def process_user_image(file: UploadFile = File(...)):
-    """استقبال صورة الشخص -> إرجاع إحداثيات الوجه الـ 3D + رابط ملف المجسم 3D الخاص بالشخص"""
     image_bytes = await file.read()
-
-    # 1. استخراج إحداثيات وجه الشخص عبر FaceLandmarker API
     face_landmarks = extract_face_landmarks(image_bytes)
-
-    # 2. توليد ملف الـ 3D للشخص عبر Tripo3D
     tripo_result = await generate_3d_from_tripo(image_bytes, file.filename)
 
     return User3DResponse(
@@ -151,4 +148,4 @@ async def process_user_image(file: UploadFile = File(...)):
         tripo_task_id=tripo_result["task_id"],
         tripo_model_url=tripo_result["model_url"],
         face_landmarks=face_landmarks
-    )
+    ) 
