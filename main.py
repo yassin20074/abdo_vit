@@ -27,6 +27,8 @@ TRIPO_API_KEY = os.getenv("TRIPO_API_KEY")
 
 MODEL_PATH = "face_landmarker.task"
 
+TRIPO_BASE_URL = "https://openapi.tripo3d.ai/v3"
+
 # تنزيل نموذج MediaPipe التلقائي إن لم يكن موجوداً
 if not os.path.exists(MODEL_PATH):
     import urllib.request
@@ -40,13 +42,13 @@ if not os.path.exists(MODEL_PATH):
 
 
 def extract_face_landmarks(image_bytes: bytes) -> FaceAnalysis:
-    """استخراج معالم الوجه الـ 3D باستخدام MediaPipe Tasks API"""
     try:
         nparr = np.frombuffer(image_bytes, np.uint8)
         img = cv2.imdecode(nparr, cv2.IMREAD_COLOR)
 
         if img is None:
-            raise HTTPException(status_code=400, detail="الصورة المرسلة غير صالحة")
+            logger.error("Failed to decode image with OpenCV")
+            return FaceAnalysis(detected=False, landmarks=[])
 
         img_rgb = cv2.cvtColor(img, cv2.COLOR_BGR2RGB)
         mp_image = mp.Image(image_format=mp.ImageFormat.SRGB, data=img_rgb)
@@ -60,13 +62,14 @@ def extract_face_landmarks(image_bytes: bytes) -> FaceAnalysis:
             base_options=BaseOptions(model_asset_path=MODEL_PATH),
             running_mode=VisionRunningMode.IMAGE,
             num_faces=1,
-            min_face_detection_confidence=0.5
+            min_face_detection_confidence=0.3 # تقليل العتبة لزيادة حساسية الاكتشاف
         )
 
         with FaceLandmarker.create_from_options(options) as landmarker:
             detection_result = landmarker.detect(mp_image)
 
             if not detection_result.face_landmarks:
+                logger.warning("No face detected in the provided image")
                 return FaceAnalysis(detected=False, landmarks=[])
 
             face_landmarks = detection_result.face_landmarks[0]
@@ -81,8 +84,6 @@ def extract_face_landmarks(image_bytes: bytes) -> FaceAnalysis:
         raise HTTPException(status_code=500, detail=f"MediaPipe processing error: {str(e)}")
 
 
-TRIPO_BASE_URL = "https://openapi.tripo3d.ai/v3"
-
 async def generate_3d_from_tripo(image_bytes: bytes, filename: str) -> dict:
     if not TRIPO_API_KEY:
         logger.error("TRIPO_API_KEY is missing in environment variables!")
@@ -94,21 +95,19 @@ async def generate_3d_from_tripo(image_bytes: bytes, filename: str) -> dict:
     }
 
     try:
-        async with httpx.AsyncClient(timeout=60.0) as client:
-            # 1. رفع الصورة عبر /files
+        async with httpx.AsyncClient(timeout=180.0) as client: # زيادة Timeout للـ HTTP Client
+            # 1. رفع الصورة
             files = {"file": (filename, image_bytes, "image/jpeg")}
             upload_headers = {"Authorization": f"Bearer {TRIPO_API_KEY}"}
             
             upload_res = await client.post(f"{TRIPO_BASE_URL}/files", headers=upload_headers, files=files)
-            
             if upload_res.status_code != 200:
-                logger.error(f"Tripo Upload Failed: {upload_res.text}")
                 raise HTTPException(status_code=500, detail=f"Tripo upload failed: {upload_res.text}")
 
             upload_data = upload_res.json().get("data", {})
             file_token = upload_data.get("file_token") or upload_data.get("image_token")
 
-            # 2. إنشاء مهمة التوليد مع تحديد الـ model المطلوبة
+            # 2. إنشاء مهمة التوليد
             task_payload = {
                 "model": "v3.0-20250812",
                 "file": {
@@ -117,33 +116,30 @@ async def generate_3d_from_tripo(image_bytes: bytes, filename: str) -> dict:
                 }
             }
 
-            task_res = await client.post(
-                f"{TRIPO_BASE_URL}/generation/image-to-model",
-                headers=headers,
-                json=task_payload
-            )
-            
+            task_res = await client.post(f"{TRIPO_BASE_URL}/generation/image-to-model", headers=headers, json=task_payload)
             if task_res.status_code != 200:
-                logger.error(f"Tripo Task Creation Failed: {task_res.text}")
                 raise HTTPException(status_code=500, detail=f"Tripo task creation failed: {task_res.text}")
 
             task_id = task_res.json().get("data", {}).get("task_id")
 
-            # 3. Polling لمتابعة حالة المهمة
+            # 3. Polling ممتد حتى 150 ثانية
             model_url = None
-            for _ in range(40):
+            for _ in range(75):
                 await asyncio.sleep(2)
                 status_res = await client.get(f"{TRIPO_BASE_URL}/tasks/{task_id}", headers=headers)
+                
                 if status_res.status_code == 200:
                     res_data = status_res.json().get("data", {})
                     current_status = res_data.get("status")
-
                     if current_status == "success":
                         output = res_data.get("output", {})
+                        # فحص كافة المخرجات المحتملة لروابط GLB/PBR
                         model_url = output.get("model_url") or output.get("pbr_model_url") or output.get("model")
+                        if not model_url and isinstance(output.get("rendered_image"), dict):
+                            model_url = output.get("model")
                         break
                     elif current_status in ["failed", "cancelled", "banned"]:
-                        logger.error(f"Tripo Task Failed: {res_data}")
+                        logger.error(f"Tripo Task Failed Status: {res_data}")
                         raise HTTPException(status_code=500, detail="Tripo 3D generation task failed")
 
             return {"task_id": task_id, "model_url": model_url}
