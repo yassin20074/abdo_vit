@@ -108,8 +108,9 @@ async def generate_3d_from_tripo(image_bytes: bytes, filename: str) -> dict:
             upload_data = upload_res.json().get("data", {})
             file_token = upload_data.get("file_token") or upload_data.get("image_token")
 
-            # 2. إنشاء مهمة التوليد عبر Endpoint المخصص لـ Image to Model في V3
+            # 2. إنشاء مهمة التوليد مع تحديد الـ model المطلوبة
             task_payload = {
+                "model": "v3.0-20250812",
                 "file": {
                     "type": "jpg",
                     "file_token": file_token
@@ -128,7 +129,7 @@ async def generate_3d_from_tripo(image_bytes: bytes, filename: str) -> dict:
 
             task_id = task_res.json().get("data", {}).get("task_id")
 
-            # 3. الاستعلام عن النتيجة بـ Polling على /v3/tasks/{task_id}
+            # 3. Polling لمتابعة حالة المهمة
             model_url = None
             for _ in range(40):
                 await asyncio.sleep(2)
@@ -139,7 +140,6 @@ async def generate_3d_from_tripo(image_bytes: bytes, filename: str) -> dict:
 
                     if current_status == "success":
                         output = res_data.get("output", {})
-                        # في V3 الاستجابة تُرجع model_url أو pbr_model_url مباشرة
                         model_url = output.get("model_url") or output.get("pbr_model_url") or output.get("model")
                         break
                     elif current_status in ["failed", "cancelled", "banned"]:
