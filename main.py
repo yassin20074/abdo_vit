@@ -1,6 +1,7 @@
 import logging
 import os
 import asyncio
+import math
 import httpx
 import cv2
 import numpy as np
@@ -38,6 +39,9 @@ if not os.path.exists(MODEL_PATH):
     except Exception as e:
         logger.error(f"Failed to download MediaPipe model: {str(e)}")
 
+# تحميل كاشف الوجوه الاحتياطي للأجسام والوجوه البعيدة جداً
+face_cascade = cv2.CascadeClassifier(cv2.data.haarcascades + 'haarcascade_frontalface_default.xml')
+
 # Pydantic Schemas للـ Response المطابق لطلبك
 class GlassesLandmarker(BaseModel):
     detected: bool
@@ -54,18 +58,16 @@ class User3DResponse(BaseModel):
 
 
 def extract_glasses_landmarker(image_bytes: bytes) -> GlassesLandmarker:
-    """استخراج حسابات النظارة (الموقع، العرض، الزاوية) بالبكسل"""
+    """استخراج حسابات النظارة (الموقع، العرض، الزاوية) بالبكسل مع دعم الصور البعيدة"""
     try:
         nparr = np.frombuffer(image_bytes, np.uint8)
-        img = cv2.imdecode(nparr, cv2.IMREAD_COLOR)
+        img_bgr = cv2.imdecode(nparr, cv2.IMREAD_COLOR)
 
-        if img is None:
+        if img_bgr is None:
             logger.error("Failed to decode image with OpenCV")
             return GlassesLandmarker(detected=False, center_x=0, center_y=0, glasses_width=0, angle=0.0)
 
-        h, w, _ = img.shape
-        img_rgb = cv2.cvtColor(img, cv2.COLOR_BGR2RGB)
-        mp_image = mp.Image(image_format=mp.ImageFormat.SRGB, data=img_rgb)
+        h_orig, w_orig, _ = img_bgr.shape
 
         BaseOptions = mp.tasks.BaseOptions
         FaceLandmarker = mp.tasks.vision.FaceLandmarker
@@ -76,51 +78,95 @@ def extract_glasses_landmarker(image_bytes: bytes) -> GlassesLandmarker:
             base_options=BaseOptions(model_asset_path=MODEL_PATH),
             running_mode=VisionRunningMode.IMAGE,
             num_faces=1,
-            min_face_detection_confidence=0.3
+            min_face_detection_confidence=0.3,
+            min_face_presence_confidence=0.3
         )
 
         with FaceLandmarker.create_from_options(options) as landmarker:
+            # 1. المحاولة الأولى: فحص الصورة الأصلية بالكامل
+            img_rgb = cv2.cvtColor(img_bgr, cv2.COLOR_BGR2RGB)
+            mp_image = mp.Image(image_format=mp.ImageFormat.SRGB, data=img_rgb)
             detection_result = landmarker.detect(mp_image)
 
+            crop_x_off, crop_y_off = 0, 0
+            curr_w, curr_h = w_orig, h_orig
+
+            # 2. إذا فشل الاكتشاف المباشر (الصورة بعيدة جداً)، نطبق اقتطاع ذكي (Adaptive Crop) للوجه
             if not detection_result.face_landmarks:
-                logger.warning("No face detected in image")
-                return GlassesLandmarker(detected=False, center_x=0, center_y=0, glasses_width=0, angle=0.0)
+                logger.info("Direct detection failed. Retrying with face crop fallback for distant images...")
+                gray = cv2.cvtColor(img_bgr, cv2.COLOR_BGR2GRAY)
+                faces = face_cascade.detectMultiScale(gray, scaleFactor=1.1, minNeighbors=3, minSize=(30, 30))
 
-            landmarks = detection_result.face_landmarks[0]
-            
-            # النقاط المرجعية:
-            # 33: العين اليسرى الخارجية | 263: العين اليمنى الخارجية
-            # 127: الصدغ الأيسر | 356: الصدغ الأيمن
-            l_eye = landmarks[33]
-            r_eye = landmarks[263]
-            l_temple = landmarks[127]
-            r_temple = landmarks[356]
+                if len(faces) > 0:
+                    # اختيار الوجه الأكبر في الصورة
+                    x, y, w_box, h_box = max(faces, key=lambda rect: rect[2] * rect[3])
+                    # إضافة هامش (Margin) حول الوجه لالتقاط كافة النقاط المرجعية والعيون
+                    margin = int(max(w_box, h_box) * 0.8)
+                    x1 = max(0, x - margin)
+                    y1 = max(0, y - margin)
+                    x2 = min(w_orig, x + w_box + margin)
+                    y2 = min(h_orig, y + h_box + margin)
 
-            # تحويل الإحداثيات إلى Pixels
-            lx, ly = l_eye.x * w, l_eye.y * h
-            rx, ry = r_eye.x * w, r_eye.y * h
-            lt_x, lt_y = l_temple.x * w, l_temple.y * h
-            rt_x, rt_y = r_temple.x * w, r_temple.y * h
+                    cropped_face = img_bgr[y1:y2, x1:x2]
+                    crop_x_off, crop_y_off = x1, y1
+                    curr_h, curr_w, _ = cropped_face.shape
 
-            # 1. منتصف النظارة (Center X, Center Y)
-            center_x = int(round((lx + rx) / 2))
-            center_y = int(round((ly + ry) / 2))
+                    # إعادة الفحص على الجزء المقتطع
+                    crop_rgb = cv2.cvtColor(cropped_face, cv2.COLOR_BGR2RGB)
+                    crop_mp_image = mp.Image(image_format=mp.ImageFormat.SRGB, data=crop_rgb)
+                    detection_result = landmarker.detect(crop_mp_image)
 
-            # 2. عرض النظارة بناءً على المسافة بين الصدغين
-            glasses_width = int(round(np.sqrt((rt_x - lt_x)**2 + (rt_y - lt_y)**2)))
+            # 3. إذا تم اكتشاف الوجه (سواء مباشرة أو بعد الاقتطاع)
+            if detection_result.face_landmarks:
+                landmarks = detection_result.face_landmarks[0]
 
-            # 3. زاوية ميلان الوجه (Angle in Degrees)
-            dx = rx - lx
-            dy = ry - ly
-            angle_rad = np.arctan2(dy, dx)
-            angle_deg = round(float(np.degrees(angle_rad)), 2)
-            return GlassesLandmarker(
-                detected=True,
-                center_x=center_x,
-                center_y=center_y,
-                glasses_width=glasses_width,
-                angle=angle_deg
-            )
+                # النقاط المرجعية الرئيسية:
+                # 33: العين اليسرى الخارجية | 263: العين اليمنى الخارجية
+                # 127: الصدغ الأيسر | 356: الصدغ الأيمن | 168: جسر الأنف
+                l_eye = landmarks[33]
+                r_eye = landmarks[263]
+                l_temple = landmarks[127]
+                r_temple = landmarks[356]
+                nose_bridge = landmarks[168]
+
+                # تحويل الإحداثيات إلى Pixels بالنسبة للصورة الأصلية الكلية
+                lx = l_eye.x * curr_w + crop_x_off
+                ly = l_eye.y * curr_h + crop_y_off
+                rx = r_eye.x * curr_w + crop_x_off
+                ry = r_eye.y * curr_h + crop_y_off
+                
+                lt_x = l_temple.x * curr_w + crop_x_off
+                lt_y = l_temple.y * curr_h + crop_y_off
+                rt_x = r_temple.x * curr_w + crop_x_off
+                rt_y = r_temple.y * curr_h + crop_y_off
+
+                nx = nose_bridge.x * curr_w + crop_x_off
+                ny = nose_bridge.y * curr_h + crop_y_off
+
+                # 1. مركز النظارة (Center X, Center Y) بناءً على جسر الأنف
+                center_x = int(round(nx))
+                center_y = int(round(ny))
+
+                # 2. عرض النظارة بناءً على المسافة بين الصدغين
+                glasses_width = int(round(math.hypot(rt_x - lt_x, rt_y - lt_y)))
+
+                # 3. زاوية ميلان الوجه (Degrees)
+                dx = rx - lx
+                dy = ry - ly
+                angle_rad = math.atan2(dy, dx)
+                angle_deg = round(float(math.degrees(angle_rad)), 2)
+
+                return GlassesLandmarker(
+                    detected=True,
+                    center_x=center_x,
+                    center_y=center_y,
+                    glasses_width=glasses_width,
+                    angle=angle_deg
+                )
+
+            logger.warning("No face detected in image after all attempts")
+            return GlassesLandmarker(detected=False, center_x=0, center_y=0, glasses_width=0, angle=0.0)
+
     except Exception as e:
         logger.error(f"Error in extract_glasses_landmarker: {str(e)}")
         return GlassesLandmarker(detected=False, center_x=0, center_y=0, glasses_width=0, angle=0.0)
@@ -145,7 +191,6 @@ async def generate_3d_from_tripo(image_bytes: bytes, filename: str) -> dict:
             upload_res = await client.post(f"{TRIPO_BASE_URL}/files", headers=upload_headers, files=files)
             if upload_res.status_code != 200:
                 raise HTTPException(status_code=500, detail=f"Tripo upload failed: {upload_res.text}")
-
             upload_data = upload_res.json().get("data", {})
             file_token = upload_data.get("file_token") or upload_data.get("image_token")
 
@@ -193,7 +238,6 @@ async def generate_3d_from_tripo(image_bytes: bytes, filename: str) -> dict:
 @app.get("/")
 def health_check():
     return {"status": "ok", "message": "Service is running"}
-
 
 @app.post("/api/v1/process-user-image", response_model=User3DResponse)
 async def process_user_image(file: UploadFile = File(...)):
