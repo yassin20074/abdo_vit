@@ -184,7 +184,7 @@ async def upload_file_to_tripo(client: httpx.AsyncClient, file_bytes: bytes, fil
     return data.get("file_token") or data.get("image_token")
 
 async def generate_multiview_3d_tripo(front_bytes: bytes, right_bytes: bytes, left_bytes: bytes) -> dict:
-    """إرسال الـ 3 صور إلى Tripo Multi-View API مع الهيكل الصحيح للـ Payload"""
+    """إرسال الـ 3 صور إلى Tripo Multi-View API بالمبنى الصحيح للـ Payload"""
     if not TRIPO_API_KEY:
         raise HTTPException(status_code=500, detail="TRIPO_API_KEY environment variable is missing")
 
@@ -201,9 +201,14 @@ async def generate_multiview_3d_tripo(front_bytes: bytes, right_bytes: bytes, le
             upload_file_to_tripo(client, left_bytes, "left.jpg")
         )
 
-        # 2. الهيكل الصحيح لـ Multi-View Generation في Tripo3D v3
+        # 2. الهيكل الصحيح للـ Payload المعتمد في Tripo v3
+        # يتضمن وجود المفتاح "file" كـ Root Parameter لتفادي خطأ 1004
         task_payload = {
             "type": "multiview_to_model",
+            "file": {
+                "type": "jpg",
+                "file_token": front_token
+            },
             "files": [
                 {"type": "jpg", "file_token": front_token},
                 {"type": "jpg", "file_token": right_token},
@@ -215,17 +220,33 @@ async def generate_multiview_3d_tripo(front_bytes: bytes, right_bytes: bytes, le
             "pbr": True
         }
 
-       
-
         task_res = await client.post(f"{TRIPO_BASE_URL}/generation/image-to-model", headers=headers, json=task_payload)
         
+        # إذا رجع خيار ortho بديل (في حال اختلاف إصدار الـ API exact schema):
+        if task_res.status_code != 200 and "1004" in task_res.text:
+            logger.warning("Retrying with alternative ortho_image structure...")
+            fallback_payload = {
+                "type": "multiview_to_model",
+                "file": {
+                    "type": "jpg",
+                    "file_token": front_token,
+                    "ortho_image": {
+                        "left": left_token,
+                        "right": right_token
+                    }
+                },
+                "model": "v3.0-20250812",
+                "pbr": True
+            }
+            task_res = await client.post(f"{TRIPO_BASE_URL}/generation/image-to-model", headers=headers, json=fallback_payload)
+
         if task_res.status_code != 200:
             logger.error(f"Tripo Error Response: {task_res.text}")
             raise HTTPException(status_code=500, detail=f"Tripo Multi-View Task Creation Failed: {task_res.text}")
 
         task_id = task_res.json().get("data", {}).get("task_id")
 
-        # 3. Polling لمتابعة تجهيز المجسم
+        # 3. Polling لمتابعة حالة التوليد
         model_url = None
         for _ in range(75):
             await asyncio.sleep(2)
