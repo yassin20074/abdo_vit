@@ -164,7 +164,7 @@ def health_check():
 
 @app.post("/api/v1/analyze-face", response_model=FaceAnalysisResponse)
 async def analyze_face(file: UploadFile = File(...)):
-    """API Endpoint يستقبل صورة المستخدم 2D ويخرج مباشرة الإحداثيات الدقيقة لتركيب النظارة في Three.js"""
+
     image_bytes = await file.read()
     
     if not image_bytes:
